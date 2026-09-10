@@ -174,10 +174,10 @@ class RoamerConfig(BaseConfig):
         )
         always_inject: bool = Field(
             default=True,
-            description="是否在每轮 prompt 都注入跨群足迹（路径B）",
-            label="常驻注入",
+            description="是否在每轮 prompt 都注入账本跨群简报（路径B）",
+            label="常驻简报注入",
             tag="ai",
-            hint="让普通 @ 回复也带着跨群记忆；关闭后仅漫游唤醒时注入。",
+            hint="关闭后简报仅随漫游唤醒（resume）注入；路径B常驻注入目前仅对 NDFC 生效。",
         )
         track_user_speech: bool = Field(
             default=False,
@@ -230,7 +230,7 @@ class RoamerConfig(BaseConfig):
             description="推送注入：每轮 prompt 自动追加跨群动态（默认关，主路径是 cross_stream_feed 工具拉取）",
             label="推送注入",
             tag="ai",
-            hint="默认关闭：Bot 需要时自己调 cross_stream_feed 工具，省 token 且全聊天器通用。",
+            hint="默认关闭：Bot 需要时自己调 cross_stream_feed 工具，省 token 且全聊天器通用。注意：推送注入通道目前仅对 NDFC 模板生效，其他聊天器请走工具拉取主路径。",
         )
         per_stream_count: int = Field(
             default=15,

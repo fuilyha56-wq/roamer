@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 import importlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
@@ -495,3 +495,145 @@ class TestCrossStreamFeedTool:
         ok, result = await tool.execute()
         assert ok is True
         assert state.carry_cursors == {}
+
+
+# ---------------------------------------------------------------- 焦点释放
+
+
+class TestFocusRelease:
+    """释放判定：空闲判定纳入 LLM 活动、硬上限随最近活跃顺延。"""
+
+    def test_quiet_focus_releases_by_idle_not_hard_cap(self) -> None:
+        """唤醒后无人说话：按唤醒时刻起算空闲释放，而非挂满硬上限。"""
+        planner = RoamingPlanner(focus_idle_timeout=240, max_focus_hold_minutes=20)
+        planner.set_streams(["s"])
+        t0 = datetime.now().astimezone()
+        planner.acquire_focus(t0)
+        release, reason = planner.should_release(
+            focus_stream="s", last_activity=t0, now=t0 + timedelta(seconds=300)
+        )
+        assert release
+        assert "空闲" in reason
+
+    def test_active_conversation_outlives_hard_cap(self) -> None:
+        """持续活跃的会话不被硬上限周期性打断（打断即多余唤醒）。"""
+        planner = RoamingPlanner(focus_idle_timeout=240, max_focus_hold_minutes=20)
+        planner.set_streams(["s"])
+        t0 = datetime.now().astimezone()
+        planner.acquire_focus(t0)
+        last = t0
+        for _ in range(30):  # 模拟半小时内每分钟一次会话活动
+            last += timedelta(seconds=60)
+            planner.note_chatter_active("s", last)
+        release, _ = planner.should_release(
+            focus_stream="s", last_activity=last, now=last + timedelta(seconds=60)
+        )
+        assert not release
+
+    def test_hard_cap_backstop_without_any_activity(self) -> None:
+        """完全无活动记录时退回占用起点兜底（原始硬上限语义保留）。"""
+        planner = RoamingPlanner(focus_idle_timeout=240, max_focus_hold_minutes=20)
+        planner.set_streams(["s"])
+        t0 = datetime.now().astimezone()
+        planner.acquire_focus(t0)
+        release, reason = planner.should_release(
+            focus_stream="s", last_activity=None, now=t0 + timedelta(minutes=21)
+        )
+        assert release
+        assert "占用" in reason
+
+    def test_last_activity_combines_ledger_and_planner(
+        self, fresh_shared_state: Any
+    ) -> None:
+        """service 侧取账本与 planner 活动的较新者（账本旧条目不遮蔽新活动）。"""
+        core = service_module.RoamerCore(SimpleNamespace(config=RoamerConfig()))
+        core.apply_config(RoamerConfig())
+        t0 = datetime.now().astimezone()
+        core.ledger.record(
+            stream_id="s",
+            text="两小时前的旧发言",
+            msg_id="m-old",
+            time=t0 - timedelta(hours=2),
+        )
+        core.planner.note_stream_type("s", "group")
+        core.planner.note_chatter_active("s", t0)
+        assert core._last_activity_of("s") == t0
+
+
+# ---------------------------------------------------------------- 强提及排序
+
+
+class TestStrongMentionRanking:
+    """强提及叠分与平分决胜。"""
+
+    def test_tied_mentions_break_by_unread_not_stream_id(self) -> None:
+        """多个群同时 @：未读多者排前（而非按 stream_id 字符串序）。"""
+        planner = RoamingPlanner()
+        now = datetime.now().astimezone()
+        planner.set_streams(["aaa", "zzz"])
+        planner.note_unread(stream_id="aaa", strong_mention=True, now=now, count=1)
+        planner.note_unread(stream_id="zzz", strong_mention=True, now=now, count=9)
+        decision = planner.pick_next(now)
+        assert decision.wake_stream == "zzz"
+
+    def test_strong_mention_score_includes_unread(self) -> None:
+        """强提及分叠加未读分量（同一流未读越多分越高）。"""
+        planner = RoamingPlanner()
+        now = datetime.now().astimezone()
+        planner.set_streams(["a", "b"])
+        planner.note_unread(stream_id="a", strong_mention=True, now=now, count=1)
+        planner.note_unread(stream_id="b", strong_mention=True, now=now, count=64)
+        assert planner.score("b", now) > planner.score("a", now)
+
+
+# ---------------------------------------------------------------- 唤醒简报
+
+
+class TestResumePrompt:
+    """唤醒简报文案：流锚点 + 跨群简报接线。"""
+
+    @pytest.mark.asyncio
+    async def test_prompt_anchors_stream_and_carries_briefing(
+        self, fresh_shared_state: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """锚定当前流、内嵌账本简报、无字面占位符与 pass_and_wait 指令。"""
+        core = service_module.RoamerCore(SimpleNamespace(config=RoamerConfig()))
+        core.apply_config(RoamerConfig())
+        now = datetime.now().astimezone()
+        core.ledger.record(
+            stream_id="other",
+            text="装机预算聊疯了",
+            msg_id="m1",
+            time=now,
+        )
+        core.planner.note_stream_type("tgt", "group")
+
+        async def fake_names(self: Any) -> dict[str, str]:
+            return {"tgt": "测试群", "other": "别的群"}
+
+        monkeypatch.setattr(service_module.RoamerCore, "_stream_names", fake_names)
+        prompt = await core._build_resume_prompt("tgt")
+        assert "测试群" in prompt
+        assert "{display}" not in prompt
+        assert "{chat_type}" not in prompt
+        assert "装机预算聊疯了" in prompt
+        assert "pass_and_wait" not in prompt
+
+    @pytest.mark.asyncio
+    async def test_prompt_briefing_excludes_own_stream(
+        self, fresh_shared_state: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """简报只含其他群的动态，不重复目标群自己的条目。"""
+        core = service_module.RoamerCore(SimpleNamespace(config=RoamerConfig()))
+        core.apply_config(RoamerConfig())
+        now = datetime.now().astimezone()
+        core.ledger.record(
+            stream_id="tgt", text="本群旧话", msg_id="m2", time=now
+        )
+
+        async def fake_names(self: Any) -> dict[str, str]:
+            return {"tgt": "测试群"}
+
+        monkeypatch.setattr(service_module.RoamerCore, "_stream_names", fake_names)
+        prompt = await core._build_resume_prompt("tgt")
+        assert "本群旧话" not in prompt

@@ -275,9 +275,21 @@ class RoamerCore(BaseService):
         await self.visit(decision.wake_stream, reason=decision.reason, now=now)
 
     def _last_activity_of(self, stream_id: str) -> datetime | None:
-        """取焦点群最近会话活动时间（账本最新发言时间近似）。"""
+        """取焦点群最近会话活动时间（账本最新发言与 LLM 活动取较新）。
+
+        只看账本会漏掉「醒了但没发言」的会话：bot 被唤醒后选择
+        不发言（如 pass 类动作）且无人说话时账本无新条目，空闲判定
+        会失明、焦点一直挂到硬上限。``note_chatter_active`` 在唤醒和
+        每次记账时都会更新 planner 的 ``last_llm_activity``，两边取 max。
+        """
+        planner_activity = self.planner.last_activity_of(stream_id)
         entries = self.ledger.entries_for(stream_id)
-        return entries[0].time if entries else None
+        ledger_activity = entries[0].time if entries else None
+        if ledger_activity is None:
+            return planner_activity
+        if planner_activity is None:
+            return ledger_activity
+        return max(ledger_activity, planner_activity)
 
     # ------------------------------------------------------------------ 唤醒
 
@@ -438,6 +450,15 @@ class RoamerCore(BaseService):
         """取目标群上次回访时间（简报的 since 边界）。"""
         return self.planner.last_visit_of(stream_id)
 
+    async def build_briefing_text(self, target_stream: str) -> str:
+        """为目标流生成账本跨群简报（resume 注入与路径 B 常驻注入共用）。"""
+        names = await self._stream_names()
+        return self.ledger.build_briefing(
+            target_stream=target_stream,
+            since=self.planner.last_visit_of(target_stream),
+            stream_names=names,
+        )
+
     async def _build_resume_prompt(
         self, stream_id: str, names: dict[str, str] | None = None
     ) -> str:
@@ -448,12 +469,15 @@ class RoamerCore(BaseService):
         当前流，否则 LLM 可能把「恢复」关联到搬运块里最显眼的其他流上下文
         （线上故障：群聊被唤醒却以为在私聊，把私聊口吻的回复发进群）。
 
+        同时附上账本跨群简报（「你最近在其他聊天里的动态」），唤醒即带着
+        跨群记忆接话——README 宣称的简报注入路径。
+
         Args:
             stream_id: 被唤醒的目标流。
             names: 流显示名映射（缺省现场拉取）。
 
         Returns:
-            str: 带当前流锚点的 resume 提示文本。
+            str: 带当前流锚点与跨群简报的 resume 提示文本。
         """
         names = names if names is not None else await self._stream_names()
         display = names.get(stream_id) or stream_id[:8]
@@ -464,14 +488,22 @@ class RoamerCore(BaseService):
             chat_type = "群聊"
         else:
             chat_type = "聊天"  # 类型未登记（如手动 visit 陌生流）时中性表述
-        return (
+        text = (
             f"系统事件：你在「{display}」（{chat_type}）的会话被唤醒。"
             "请基于已有上下文主动决定下一步。"
-            "如果现在无需继续处理，请调用 pass_and_wait；"
+            "如果现在无需继续处理，可以不发言或仅简短观察；"
             "如果需要回复或执行动作，请直接使用相应工具。"
-            "注意：你的回复将发送到「{display}」（{chat_type}），"
+            f"注意：你的回复将发送到「{display}」（{chat_type}），"
             "与其他聊天无关。"
         )
+        try:
+            briefing = await self.build_briefing_text(stream_id)
+        except Exception as error:  # noqa: BLE001  简报失败不阻断唤醒
+            logger.debug(f"账本简报构建失败: {error}")
+            briefing = ""
+        if briefing:
+            text = f"{text}\n\n{briefing}"
+        return text
 
     async def _stream_names(self) -> dict[str, str]:
         """取漫游域成员的显示名映射。"""

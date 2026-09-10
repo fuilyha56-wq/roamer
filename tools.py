@@ -11,7 +11,7 @@
 
 from __future__ import annotations
 
-from typing import Annotated, Any
+from typing import Annotated
 
 from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.api import service_api

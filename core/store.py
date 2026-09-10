@@ -172,6 +172,30 @@ async def mirror_message(
     return True
 
 
+async def is_bot_message(msg_id: str) -> bool:
+    """查询一条消息是否为 bot 自己发出（「回复 bot」判定用）。
+
+    ``Message.reply_to`` 存的是**被回复消息的 ID**（非用户 ID），无法直接
+    从消息对象判断回复目标是谁；镜像库按 ``msg_id`` 存有 ``is_bot``，
+    查一次即可判定。未镜像过（插件启动前/域外/超龄清理）返回 False，
+    此时退化为仅靠 @ 文本判定强提及。
+
+    Args:
+        msg_id: 被回复消息的 ID。
+
+    Returns:
+        bool: 该消息在镜像库中标记为 bot 发言返回 True。
+    """
+    if not msg_id:
+        return False
+    try:
+        row = await get_db().crud(MirrorMessage).get_by(msg_id=msg_id)
+    except Exception as error:  # noqa: BLE001  查询失败按非 bot 处理
+        logger.debug(f"reply 归属查询失败: {error}")
+        return False
+    return bool(row is not None and row.is_bot)
+
+
 async def recent_messages(
     *,
     exclude_stream: str,

@@ -7,14 +7,17 @@
   + 可选的用户消息追踪记账；
 - :class:`FocusGateHandler`：NDFC ``:preprocess`` → 串行专注门（可选，默认关）；
 - :class:`CrossStreamInjectHandler`：``on_prompt_build`` → 路径 B 常驻注入
-  跨群原文搬运（默认开，``carry.enabled=false`` 或
-  ``carry.inject_on_every_turn=false`` 关闭）；
+  跨群原文搬运与账本简报。**默认关**：``carry.enabled`` 且
+  ``carry.inject_on_every_turn`` 都为 true 才注入搬运块；账本简报部分还
+  要求 ``ledger.always_inject=true``。且目前只匹配 NDFC 的模板名前缀，
+  其他聊天器（KFC 等）即使开启注入开关也不会被注入（见类 docstring）；
 - :class:`BehaviorObserveHandler`：``after_tool_call`` / ``after_action_call``
   → Bot 行为镜像（工具/动作调用流水，供行为搬运）；
 - :class:`CarryAckHandler`：``after_llm_request`` / ``on_llm_request_failed``
   → 搬运 ACK 游标推进/回滚（请求成功才推进，失败保留内容下次补发）。
 
-本包共用模块级助手：``_extract_text`` / ``_reply_to_bot`` / ``_MENTION_PATTERN``。
+本包共用模块级助手：``_extract_text`` / ``_bot_self_id`` / ``_mentioned_bot``
+/ ``_reply_to_bot`` / ``_MENTION_PATTERN``。
 """
 
 from __future__ import annotations
@@ -23,8 +26,8 @@ import re
 from datetime import datetime
 from typing import Any
 
+from src.app.plugin_system.api import service_api, stream_api
 from src.app.plugin_system.api.log_api import get_logger
-from src.app.plugin_system.api import service_api
 from src.app.plugin_system.base import BaseEventHandler
 from src.kernel.event import EventDecision
 
@@ -36,7 +39,7 @@ from ..core.service import (
     _SharedState,
 )
 from ..core.reminder import set_cross_stream_reminder
-from ..core.store import mirror_action, mirror_message
+from ..core.store import is_bot_message, mirror_action, mirror_message
 
 __all__ = [
     "LedgerRecordHandler",
@@ -45,7 +48,6 @@ __all__ = [
     "CrossStreamInjectHandler",
     "BehaviorObserveHandler",
     "CarryAckHandler",
-    "bot_platform_id",
 ]
 
 logger = get_logger("roamer.handlers")
@@ -56,8 +58,15 @@ _CORE_SIGNATURE = "roamer:service:roamer_core"
 #: NDFC preprocess 事件名（字符串字面量订阅，不跨插件 import，见规范 §2.5）
 _NDFC_PREPROCESS = "neo_default_chatter:preprocess"
 
-#: 强提及判定：消息文本中 @ 了 bot（宽松启发式：@ + 非空白片段）
+#: 强提及判定的兜底正则：仅在 bot 自身 ID 无法解析时使用（宽松启发式，
+#: 会把 @ 任何人都算作强提及；框架同款 at_users 判定可用时不走这里）
 _MENTION_PATTERN = re.compile(r"@[^\s，。,.\u2005]{1,32}")
+
+#: stream_id → bot 平台 ID 缓存（只在消息 raw_data 缺 self_id 时兜底查询用）
+_BOT_ID_CACHE: dict[str, str] = {}
+
+#: 已打过「无法解析 bot ID」提醒的流（每流只提示一次，避免刷日志）
+_BOT_ID_WARNED: set[str] = set()
 
 
 def _get_core(plugin) -> RoamerCore | None:
@@ -75,25 +84,79 @@ def _extract_text(message: Any) -> str:
     return content if isinstance(content, str) else ""
 
 
-def _reply_to_bot(message: Any, bot_id: str) -> bool:
-    """启发式判断消息是否回复了 bot（reply_to 命中 bot ID 前缀）。"""
-    reply_to = getattr(message, "reply_to", None)
-    return bool(reply_to and bot_id and str(reply_to).startswith(str(bot_id)))
+async def _bot_self_id(message: Any) -> str:
+    """取 bot 在该消息平台的自身 ID（框架 :meth:`_message_mentions_bot` 同款）。
 
+    优先 ``raw_data["self_id"]``（adapter 回填）；缺省回退该流
+    ``chat_stream.bot_id``（stream_manager 从 bot_info 配置回填），
+    经 ``stream_api`` 查询（内存 dict，开销可忽略）并按流缓存。
 
-def bot_platform_id() -> str:
-    """取 bot 平台 ID（用于回复命中判定；取不到返回空串）。"""
-    try:
-        from src.core.config import get_core_config
-
-        account = getattr(get_core_config(), "personality", None)
-        for attr in ("bot_qq", "bot_id", "qq"):
-            value = getattr(account, attr, "")
-            if value:
-                return str(value)
-    except Exception:  # noqa: BLE001  观测性判定失败按无处理
+    Returns:
+        str: bot 平台 ID；解析不到返回空串（每流只 debug 一次）。
+    """
+    raw = getattr(message, "raw_data", None)
+    if isinstance(raw, dict):
+        self_id = raw.get("self_id")
+        if self_id:
+            return str(self_id)
+    stream_id = str(getattr(message, "stream_id", "") or "")
+    if not stream_id:
         return ""
-    return ""
+    cached = _BOT_ID_CACHE.get(stream_id)
+    if cached:
+        return cached
+    try:
+        chat_stream = await stream_api.get_stream(stream_id)
+        bot_id = (
+            str(getattr(chat_stream, "bot_id", "") or "")
+            if chat_stream is not None
+            else ""
+        )
+    except Exception:  # noqa: BLE001  观测性判定失败按无处理
+        bot_id = ""
+    if bot_id:
+        _BOT_ID_CACHE[stream_id] = bot_id
+    elif stream_id not in _BOT_ID_WARNED:
+        _BOT_ID_WARNED.add(stream_id)
+        logger.debug(
+            f"无法解析 stream={stream_id[:8]} 的 bot ID，@ 提及退回宽松正则判定"
+        )
+    return bot_id
+
+
+async def _mentioned_bot(message: Any, bot_id: str) -> bool:
+    """判断消息是否 @ 了 bot（框架同款启发式）。
+
+    ``extra["at_users"]`` 命中 self_id，或 at 段序列化文本
+    （``:<self_id>>``）出现在正文里。bot ID 解析不到时退回宽松正则
+    （@ 任何人都算，宁可信其有——强提及只是唤醒/豁免信号）。
+    """
+    if not bot_id:
+        text = _extract_text(message)
+        return bool(text and _MENTION_PATTERN.search(text))
+    extra = getattr(message, "extra", None)
+    at_users = extra.get("at_users", []) if isinstance(extra, dict) else []
+    if isinstance(at_users, list):
+        for at_user in at_users:
+            if isinstance(at_user, dict) and str(at_user.get("user_id")) == bot_id:
+                return True
+    content = _extract_text(message) or str(getattr(message, "content", "") or "")
+    return f":{bot_id}>" in content
+
+
+async def _reply_to_bot(message: Any) -> bool:
+    """判断消息是否回复了 bot 的消息。
+
+    ``Message.reply_to`` 存的是被回复**消息**的 ID（非用户 ID），不能与
+    bot 账号比对；查镜像库该消息的 ``is_bot`` 标记判定（未镜像过视为否）。
+    """
+    reply_to = getattr(message, "reply_to", None)
+    if not reply_to:
+        return False
+    try:
+        return await is_bot_message(str(reply_to))
+    except Exception:  # noqa: BLE001  观测性判定失败按无处理
+        return False
 
 
 def _normalize_message_time(message: Any, fallback: datetime) -> datetime:
@@ -238,7 +301,7 @@ class UnreadObserveHandler(BaseEventHandler):
             core.planner.note_stream_type(stream_id, chat_type)
         if not core.planner.in_domain(stream_id):
             return EventDecision.PASS, params
-        strong = self._is_strong_mention(message)
+        strong = await self._is_strong_mention(message)
         now = datetime.now().astimezone()
         core.planner.note_unread(
             stream_id=stream_id,
@@ -287,51 +350,56 @@ class UnreadObserveHandler(BaseEventHandler):
                 logger.debug(f"刷新跨群 reminder 失败: {error}")
         return EventDecision.PASS, params
 
-    def _is_strong_mention(self, message: Any) -> bool:
+    async def _is_strong_mention(self, message: Any) -> bool:
         """判断消息是否强提及 bot。
 
         私聊 = 直接对话，恒为强提及（唤醒插队 + 专注门豁免）；
-        群聊 = @ 文本命中或回复了 bot 消息。
+        群聊 = 回复了 bot 消息，或 @ 命中 bot（框架同款 at_users 判定）。
         """
         chat_type = str(getattr(message, "chat_type", "") or "")
         if chat_type == "private":
             return True
-        if _reply_to_bot(message, bot_platform_id()):
+        if await _reply_to_bot(message):
             return True
-        text = _extract_text(message)
-        return bool(text and _MENTION_PATTERN.search(text))
+        bot_id = await _bot_self_id(message)
+        return await _mentioned_bot(message, bot_id)
 
 
 class CrossStreamInjectHandler(BaseEventHandler):
-    """``on_prompt_build`` 路径 B 常驻注入 handler（默认开）。
+    """``on_prompt_build`` 路径 B 常驻注入 handler（默认关）。
 
-    对 NDFC 的 user prompt 模板渲染协作追加 ``values["extra"]``——把漫游域内
-    其他群的**最新消息原文**（与 NDFC 历史消息同格式，零转写）注入，
-    让**普通 @ 回复**也带着跨群一手见闻，不再出现「我看不到别的群」。
+    对 NDFC 的 user prompt 模板渲染协作追加 ``values["extra"]``：
+
+    - 跨群**最新消息原文**搬运块（与 NDFC 历史消息同格式，零转写）——
+      ``carry.enabled=true`` 且 ``carry.inject_on_every_turn=true`` 时生效；
+    - 账本**跨群简报**（「你最近在其他聊天……」）——
+      ``ledger.always_inject=true`` 时生效。
+
+    已知限制：只处理模板名以 ``neo_default_chatter`` 开头的 NDFC 模板，
+    KFC 等其他聊天器即使开启上述开关也不会被注入（其模板名不匹配），
+    主路径（漫游唤醒 reminder + ``cross_stream_feed`` Tool）不受影响。
 
     非侵入保证：
 
-    - 仅处理模板名以 ``neo_default_chatter:`` 开头的 NDFC 模板；
-    - 原文块为空时不追加任何内容；
-    - ``carry.enabled=false`` 或 ``carry.inject_on_every_turn=false`` 时整体 PASS。
+    - 原文块与简报均为空时不追加任何内容；
+    - 相关开关任一关闭时整体 PASS。
     """
 
     name = "cross_stream_inject"
-    description = "路径B常驻注入：每轮 prompt 追加跨群原文搬运"
+    description = "路径B常驻注入：每轮 prompt 追加跨群原文搬运与账本简报"
     weight = 200
     init_subscribe = ["on_prompt_build"]
 
     async def execute(
         self, event_name: str, params: dict[str, Any]
     ) -> tuple[EventDecision, dict[str, Any]]:
-        """向 NDFC user prompt 注入跨群原文。"""
+        """向 NDFC user prompt 注入跨群原文与账本简报。"""
         cfg = self.plugin.config if isinstance(self.plugin.config, RoamerConfig) else None
-        if (
-            cfg is None
-            or not cfg.roamer.enabled
-            or not cfg.carry.enabled
-            or not cfg.carry.inject_on_every_turn
-        ):
+        if cfg is None or not cfg.roamer.enabled:
+            return EventDecision.PASS, params
+        carry_wanted = cfg.carry.enabled and cfg.carry.inject_on_every_turn
+        briefing_wanted = cfg.carry.enabled and cfg.ledger.always_inject
+        if not carry_wanted and not briefing_wanted:
             return EventDecision.PASS, params
         template_name = str(params.get("name", "") or "")
         # NDFC 模板名前缀是下划线形式（neo_default_chatter_system_prompt 等），
@@ -347,12 +415,25 @@ class CrossStreamInjectHandler(BaseEventHandler):
         core = _get_core(self.plugin)
         if core is None:
             return EventDecision.PASS, params
-        carry_text = await core.build_carry_text(stream_id, register_pending=True)
-        if not carry_text:
+        chunks: list[str] = []
+        if carry_wanted:
+            carry_text = await core.build_carry_text(stream_id, register_pending=True)
+            if carry_text:
+                chunks.append(carry_text)
+        if briefing_wanted:
+            try:
+                briefing = await core.build_briefing_text(stream_id)
+            except Exception as error:  # noqa: BLE001  简报失败不阻断
+                logger.debug(f"账本简报构建失败: {error}")
+                briefing = ""
+            if briefing:
+                chunks.append(briefing)
+        if not chunks:
             return EventDecision.SUCCESS, params  # 无内容不追加，但放行默认链
+        inject_text = "\n".join(chunks)
         existing_extra = str(values.get("extra", "") or "")
         values["extra"] = (
-            f"{existing_extra}\n{carry_text}" if existing_extra else carry_text
+            f"{existing_extra}\n{inject_text}" if existing_extra else inject_text
         )
         return EventDecision.SUCCESS, params
 
@@ -394,24 +475,23 @@ class FocusGateHandler(BaseEventHandler):
         # 私聊永不拦截：直接对话优先于串行专注，私聊也要能用
         if core.planner.is_private_stream(stream_id):
             return EventDecision.PASS, params
-        if cfg.focus_gate.strong_mention_exempt and self._has_strong_mention(params):
+        if cfg.focus_gate.strong_mention_exempt and await self._has_strong_mention(params):
             return EventDecision.PASS, params
         params["proceed"] = False
         params["reason"] = "roamer: 人在别处（焦点在其他聊天）"
         return EventDecision.SUCCESS, params
 
-    def _has_strong_mention(self, params: dict[str, Any]) -> bool:
+    async def _has_strong_mention(self, params: dict[str, Any]) -> bool:
         """从 preprocess payload 的未读列表判断是否有强提及。
 
         私聊消息视为强提及（直接对话）。"""
-        bot_id = bot_platform_id()
         for message in params.get("unreads") or []:
             if str(getattr(message, "chat_type", "") or "") == "private":
                 return True
-            if _reply_to_bot(message, bot_id):
+            if await _reply_to_bot(message):
                 return True
-            text = _extract_text(message)
-            if text and _MENTION_PATTERN.search(text):
+            bot_id = await _bot_self_id(message)
+            if await _mentioned_bot(message, bot_id):
                 return True
         return False
 

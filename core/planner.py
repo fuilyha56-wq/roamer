@@ -209,6 +209,11 @@ class RoamingPlanner:
         state = self._states.get(stream_id)
         return state.last_visit if state else None
 
+    def last_activity_of(self, stream_id: str) -> datetime | None:
+        """返回某流最近的会话活动时间（唤醒/LLM 请求/发言，空闲判定用）。"""
+        state = self._states.get(stream_id)
+        return state.last_llm_activity if state else None
+
     # ------------------------------------------------------------------ 调度
 
     def release_focus(self, now: datetime, reason: str = "") -> bool:
@@ -248,8 +253,16 @@ class RoamingPlanner:
             seconds=self.focus_idle_timeout
         ):
             return True, f"焦点空闲超过 {self.focus_idle_timeout}s"
-        if self._focus_since is not None and now - self._focus_since > self.max_focus_hold:
-            return True, f"焦点占用超过 {self.max_focus_hold}"
+        if self._focus_since is not None:
+            # 硬上限从最近活动起算：活跃会话不被周期性打断
+            # （静默会话由上面的空闲判定兜底；活动缺失时退回占用起点）
+            anchor = (
+                max(self._focus_since, last_activity)
+                if last_activity is not None
+                else self._focus_since
+            )
+            if now - anchor > self.max_focus_hold:
+                return True, f"焦点占用超过 {self.max_focus_hold}"
         return False, ""
 
     def acquire_focus(self, now: datetime) -> None:
@@ -259,7 +272,8 @@ class RoamingPlanner:
     def score(self, stream_id: str, now: datetime) -> float:
         """计算某群的兴趣分（选下一站依据）。
 
-        - 强提及直接给高分插队（被点名就该回去）；
+        - 强提及在未读/回访分**之上**再叠加固定插队分（被点名就该回去；
+          叠加而非替换，多个群同时 @ 时未读多/等得久的排前面）；
         - 私聊直通信：直接对话的优先级天然高于群聊插队；
         - 未读数按**对数曲线**折算（刷屏群不线性霸占焦点，
           高未读区仍保留区分度）；
@@ -269,20 +283,20 @@ class RoamingPlanner:
         if state is None:
             return 0.0
         private_bonus = self.private_weight if state.chat_type == "private" else 0.0
-        if state.has_strong_mention:
-            return self.at_bot_weight + private_bonus
-        score = private_bonus + self.unread_weight * math.log(
+        dynamic = self.unread_weight * math.log(
             state.unread_count + 1, self.curiosity_log_base
         )
         if state.last_visit is None:
-            score += 5.0 * self.revisit_weight  # 从没去过：优先探索
+            dynamic += 5.0 * self.revisit_weight  # 从没去过：优先探索
         else:
             gap = (now - state.last_visit).total_seconds()
             # 每 10 分钟一档，封顶 10 档（防长期冷宫群分值无限膨胀）
-            score += self.revisit_weight * min(
+            dynamic += self.revisit_weight * min(
                 10.0, max(0.0, gap) / 600.0
             )
-        return score
+        if state.has_strong_mention:
+            return self.at_bot_weight + private_bonus + dynamic
+        return private_bonus + dynamic
 
     def pick_next(self, now: datetime) -> FocusDecision:
         """选出本 tick 应唤醒的流（serial 模式的核心）。
@@ -308,11 +322,12 @@ class RoamingPlanner:
             # 没有未读且没被提及：去了也没事干（真人不会空转跑群）
             if state.unread_count <= 0 and not state.has_strong_mention:
                 continue
-            candidates.append((self.score(sid, now), sid))
+            # 平分时按未读数决胜（而非 stream_id 序），sid 只作最终稳定排序
+            candidates.append((self.score(sid, now), state.unread_count, sid))
         if not candidates:
             return FocusDecision(None, "无可唤醒候选")
         candidates.sort(reverse=True)
-        best_score, best_sid = candidates[0]
+        best_score, _, best_sid = candidates[0]
         return FocusDecision(best_sid, f"兴趣分 {best_score:.1f}")
 
     def pick_parallel_batch(
@@ -346,12 +361,12 @@ class RoamingPlanner:
                 continue
             if state.unread_count <= 0 and not state.has_strong_mention:
                 continue
-            candidates.append((self.score(sid, now), sid))
+            candidates.append((self.score(sid, now), state.unread_count, sid))
         candidates.sort(reverse=True)
-        picked = [sid for _, sid in candidates[:cap]]
+        picked = [sid for _, _, sid in candidates[:cap]]
         reason = (
             f"并发唤醒 {len(picked)} 个流（兴趣分 "
-            f"{', '.join(f'{s:.1f}' for s, _ in candidates[:cap])}）"
+            f"{', '.join(f'{s:.1f}' for s, _, _ in candidates[:cap])}）"
             if picked
             else "无可唤醒候选"
         )
