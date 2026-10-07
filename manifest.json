@@ -1,7 +1,7 @@
 {
   "name": "roamer",
   "display_name": "交互互通漫游",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "多群漫游调度层：串行焦点 + 一手发言账本 + 跨群互通简报，零侵入 NDFC",
   "author": "Lycoris radiata",
   "license": "AGPL-3.0",
@@ -71,7 +71,7 @@
     "log_api": "1.0.0",
     "service_api": "1.0.0",
     "storage_api": "1.0.0",
-    "stream_api": "1.0.0"
+    "stream_api": "2.0.0"
   },
   "python_dependencies": [],
   "dependencies_required": false,
